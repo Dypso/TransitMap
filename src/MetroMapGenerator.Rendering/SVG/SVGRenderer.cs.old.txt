@@ -1,0 +1,894 @@
+using System;
+using System.Globalization;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using System.Text;
+using System.Threading.Tasks;
+using MetroMapGenerator.Core.Interfaces;
+using MetroMapGenerator.Core.Models;
+using MetroMapGenerator.Core.Configuration;
+using System.Web;
+
+namespace MetroMapGenerator.Rendering.SVG
+{
+    public partial class SVGRenderer : ISVGRenderer
+    {
+        private readonly StringBuilder _builder;
+        private Vector2 _minBounds;
+        private Vector2 _maxBounds;
+        private Vector2 _scale;
+        private Vector2 _offset;
+        
+        // Constantes pour le rendu
+        private const float GRID_SIZE = 0.005f; // ~500m en coordonnées GPS
+        private const float TRANSFER_DISTANCE = 0.005f;
+        private const float MIN_SEGMENT_LENGTH = 0.002f;
+        private const int ANGLE_SNAP = 45;
+        private const double EPSILON = 1e-10;
+
+        // Couleurs des lignes de métro
+        private static readonly Dictionary<string, string> LineColors = new()
+        {
+            {"A", "#E8308A"}, // Rouge/Rose
+            {"B", "#0075BF"}, // Bleu
+            {"C", "#F59C00"}, // Orange
+            {"D", "#009E3D"}  // Vert
+        };
+
+        private readonly Dictionary<string, List<TransportNode>> _routeNodes;
+        private readonly Dictionary<string, List<LineSegment>> _routeSegments;
+        private readonly Dictionary<string, MetroLine> _metroLines;
+
+        public SVGRenderer()
+        {
+            _builder = new StringBuilder();
+            _routeNodes = new Dictionary<string, List<TransportNode>>();
+            _routeSegments = new Dictionary<string, List<LineSegment>>();
+            _metroLines = new Dictionary<string, MetroLine>();
+        }
+
+        public async Task<string> RenderMapAsync(
+            IEnumerable<TransportNode> nodes,
+            IEnumerable<TransportEdge> edges,
+            RenderingOptions options)
+        {
+            return await Task.Run(() =>
+            {
+                try
+                {
+                    var validNodes = ValidateNodes(nodes);
+                    var validEdges = ValidateEdges(edges, validNodes);
+
+                    InitializeRendering(validNodes, validEdges);
+
+                    _builder.Clear();
+                    WriteHeader(options);
+                    WriteStyles(options);
+                    WriteMetroLines(validEdges, validNodes, options);
+                    WriteStations(validNodes, options);
+                    WriteLabels(validNodes, options);
+                    WriteFooter();
+
+                    return _builder.ToString();
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Error rendering metro map", ex);
+                }
+            });
+        }
+
+        private void InitializeRendering(List<TransportNode> nodes, List<TransportEdge> edges)
+        {
+            // Grouper les nœuds par ligne
+            GroupNodesByRoute(nodes, edges);
+            
+            // Calculer les limites et l'échelle
+            CalculateBoundsAndScale(nodes);
+            
+            // Optimiser le placement des nœuds
+            OptimizeNodePlacement(nodes);
+            
+            // Calculer les segments de ligne optimisés
+            CalculateRouteSegments(edges, nodes);
+        }
+
+    private void CalculateRouteSegments(List<TransportEdge> edges, List<TransportNode> nodes)
+    {
+        _routeSegments.Clear();
+        var nodeDict = nodes.ToDictionary(n => n.Id);
+
+        // Grouper les segments par ligne
+        var routeGroups = edges.GroupBy(e => GetMainRouteId(e.RouteId));
+
+        foreach (var routeGroup in routeGroups)
+        {
+            var metroLine = CreateMetroLine(routeGroup, nodeDict);
+            if (metroLine.Points.Count < 2) continue;
+
+            OptimizeLineGeometry(metroLine);
+            _metroLines[routeGroup.Key] = metroLine;
+            
+            // Générer les segments finaux
+            var segments = BuildLineSegments(metroLine);
+            _routeSegments[routeGroup.Key] = segments;
+        }
+    }
+
+
+    private List<LineSegment> BuildLineSegments(MetroLine line)
+    {
+        var segments = new List<LineSegment>();
+        if (line.Points.Count < 2) return segments;
+
+        for (int i = 0; i < line.Points.Count - 1; i++)
+        {
+            var start = line.Points[i];
+            var end = line.Points[i + 1];
+
+            // Vérifier si le segment est trop court
+            if (Vector2.Distance(start, end) < MIN_SEGMENT_LENGTH)
+                continue;
+
+            segments.Add(new LineSegment
+            {
+                Start = start,
+                End = end,
+                RouteId = line.RouteId,
+                IsTransfer = IsTransferPoint(line.Stations[i], line.Stations[Math.Min(i + 1, line.Stations.Count - 1)])
+            });
+        }
+
+        return segments;
+    }
+
+    private bool IsTransferPoint(TransportNode node1, TransportNode node2)
+    {
+        return node1.Type == NodeType.Transfer || node2.Type == NodeType.Transfer;
+    }
+
+
+
+        private MetroLine CreateMetroLine(IGrouping<string, TransportEdge> routeGroup, Dictionary<int, TransportNode> nodeDict)
+        {
+            var startNode = FindTerminus(routeGroup, nodeDict);
+            var line = new MetroLine
+            {
+                RouteId = routeGroup.Key,
+                Color = GetRouteColor(routeGroup.Key),
+                IsMainLine = true
+            };
+
+            if (startNode == null || !routeGroup.Any()) 
+                return line;
+
+            line.Points.Add(startNode.Position);
+            line.Stations.Add(startNode);
+
+            var processed = new HashSet<int> { startNode.Id };
+            var currentNode = startNode;
+
+            while (true)
+            {
+                var nextEdge = routeGroup.FirstOrDefault(e =>
+                    (e.SourceNodeId == currentNode.Id || e.TargetNodeId == currentNode.Id) &&
+                    !processed.Contains(e.SourceNodeId == currentNode.Id ? e.TargetNodeId : e.SourceNodeId));
+
+                // Modification ici : plus de vérification HasValue
+                if (nextEdge == null) break;
+
+                var nextNodeId = nextEdge.SourceNodeId == currentNode.Id ? nextEdge.TargetNodeId : nextEdge.SourceNodeId;
+                if (!nodeDict.TryGetValue(nextNodeId, out var nextNode)) break;
+
+                if (IsTransferPoint(currentNode, nextNode))
+                {
+                    AddIntermediatePoints(line, currentNode.Position, nextNode.Position);
+                }
+                else
+                {
+                    line.Points.Add(nextNode.Position);
+                }
+
+                line.Stations.Add(nextNode);
+                processed.Add(nextNodeId);
+                currentNode = nextNode;
+            }
+
+            return line;
+        }
+
+        private TransportNode? FindTerminus(IGrouping<string, TransportEdge> routeGroup, Dictionary<int, TransportNode> nodeDict)
+        {
+            var nodeDegrees = new Dictionary<int, int>();
+
+            // Calculer le degré de chaque nœud
+            foreach (var edge in routeGroup)
+            {
+                if (!nodeDegrees.ContainsKey(edge.SourceNodeId))
+                    nodeDegrees[edge.SourceNodeId] = 0;
+                if (!nodeDegrees.ContainsKey(edge.TargetNodeId))
+                    nodeDegrees[edge.TargetNodeId] = 0;
+
+                nodeDegrees[edge.SourceNodeId]++;
+                nodeDegrees[edge.TargetNodeId]++;
+            }
+
+            // Trouver un nœud avec degré 1 (terminus)
+            var terminusId = nodeDegrees.FirstOrDefault(kvp => kvp.Value == 1).Key;
+            return nodeDict.GetValueOrDefault(terminusId);
+        }
+
+     private void AddIntermediatePoints(MetroLine line, Vector2 start, Vector2 end)
+    {
+        const int CURVE_POINTS = 4;
+        var direction = end - start;
+        var length = direction.Length();
+        var normal = new Vector2(-direction.Y, direction.X) / length;
+
+        for (int i = 1; i < CURVE_POINTS; i++)
+        {
+            float t = i / (float)CURVE_POINTS;
+            var point = Vector2.Lerp(start, end, t);
+            
+            // Ajouter une légère courbe
+            var bulge = (float)Math.Sin(t * Math.PI) * length * 0.1f;
+            point += normal * bulge;
+            
+            line.Points.Add(point);
+        }
+    }
+
+
+
+   private void OptimizeLineGeometry(MetroLine line)
+    {
+        if (line.Points.Count < 3) return;
+
+        var optimizedPoints = new List<Vector2> { line.Points[0] };
+        
+        for (int i = 1; i < line.Points.Count - 1; i++)
+        {
+            var prev = line.Points[i - 1];
+            var curr = line.Points[i];
+            var next = line.Points[i + 1];
+
+            var angle = CalculateAngle(prev, curr, next);
+            
+            // Conserver les points aux changements de direction significatifs
+            if (Math.Abs(angle - 180) > ANGLE_SNAP / 2)
+            {
+                curr = SnapToGrid(curr);
+                optimizedPoints.Add(curr);
+            }
+        }
+
+        optimizedPoints.Add(line.Points[^1]);
+        line.Points = optimizedPoints;
+    }
+
+    private Vector2 SnapToGrid(Vector2 point)
+    {
+        return new Vector2(
+            MathF.Round(point.X / GRID_SIZE) * GRID_SIZE,
+            MathF.Round(point.Y / GRID_SIZE) * GRID_SIZE
+        );
+    }
+
+    private float CalculateAngle(Vector2 p1, Vector2 p2, Vector2 p3)
+    {
+        var v1 = Vector2.Normalize(p1 - p2);
+        var v2 = Vector2.Normalize(p3 - p2);
+        var dot = Vector2.Dot(v1, v2);
+        
+        // Éviter les erreurs d'arrondi
+        dot = Math.Clamp(dot, -1f, 1f);
+        
+        return MathF.Acos(dot) * 180f / MathF.PI;
+    }
+
+
+        private List<TransportNode> ValidateNodes(IEnumerable<TransportNode> nodes)
+        {
+            if (nodes == null) 
+                throw new ArgumentNullException(nameof(nodes));
+
+            var validNodes = nodes.Where(n =>
+                n != null &&
+                !float.IsNaN(n.Position.X) && !float.IsNaN(n.Position.Y) &&
+                !float.IsInfinity(n.Position.X) && !float.IsInfinity(n.Position.Y)
+            ).ToList();
+
+            if (!validNodes.Any())
+                throw new ArgumentException("No valid nodes provided for rendering");
+
+            return validNodes;
+        }
+
+        private List<TransportEdge> ValidateEdges(
+            IEnumerable<TransportEdge> edges,
+            List<TransportNode> validNodes)
+        {
+            if (edges == null)
+                return new List<TransportEdge>();
+
+            var nodeIds = validNodes.Select(n => n.Id).ToHashSet();
+            return edges.Where(e =>
+                nodeIds.Contains(e.SourceNodeId) &&
+                nodeIds.Contains(e.TargetNodeId)
+            ).ToList();
+        }
+
+        private class MetroLine
+        {
+            public required string RouteId { get; init; }
+            public List<Vector2> Points { get; set; } = new();
+            public List<TransportNode> Stations { get; set; } = new();
+            public bool IsMainLine { get; init; }
+            public required string Color { get; init; }
+        }
+
+        private class LineSegment
+        {
+            public required Vector2 Start { get; init; }
+            public required Vector2 End { get; init; }
+            public required string RouteId { get; init; }
+            public bool IsTransfer { get; init; }
+            public float Angle => MathF.Atan2(End.Y - Start.Y, End.X - Start.X);
+        }
+
+        private Vector2 TransformPoint(Vector2 point)
+        {
+            return new Vector2(
+                (point.X - _minBounds.X) * _scale.X + _offset.X,
+                (point.Y - _minBounds.Y) * _scale.Y + _offset.Y
+            );
+        }
+    }
+
+
+
+
+
+
+
+
+public partial class SVGRenderer
+{
+    private void CalculateBoundsAndScale(List<TransportNode> nodes)
+    {
+        // Déterminer les limites des coordonnées
+        _minBounds = new Vector2(
+            nodes.Min(n => n.Position.X),
+            nodes.Min(n => n.Position.Y)
+        );
+        _maxBounds = new Vector2(
+            nodes.Max(n => n.Position.X),
+            nodes.Max(n => n.Position.Y)
+        );
+
+        // Calculer les dimensions
+        float width = _maxBounds.X - _minBounds.X;
+        float height = _maxBounds.Y - _minBounds.Y;
+
+        if (width <= EPSILON || height <= EPSILON)
+            throw new InvalidOperationException("Invalid coordinate range");
+
+        // Ajuster l'échelle pour maintenir les proportions
+        float scale = Math.Min(800 / width, 600 / height);
+        _scale = new Vector2(scale, -scale); // Y inversé pour SVG
+
+        // Centrer le rendu
+        _offset = new Vector2(
+            (800 - width * scale) / 2,
+            600 + (600 - height * scale) / 2
+        );
+    }
+
+    private void GroupNodesByRoute(List<TransportNode> nodes, List<TransportEdge> edges)
+    {
+        _routeNodes.Clear();
+        _metroLines.Clear();
+
+        foreach (var edge in edges)
+        {
+            var mainRouteId = GetMainRouteId(edge.RouteId);
+            
+            if (!_routeNodes.ContainsKey(mainRouteId))
+            {
+                _routeNodes[mainRouteId] = new List<TransportNode>();
+                _metroLines[mainRouteId] = new MetroLine
+                {
+                    RouteId = mainRouteId,
+                    IsMainLine = true,
+                    Color = GetRouteColor(mainRouteId)
+                };
+            }
+
+            var sourceNode = nodes.First(n => n.Id == edge.SourceNodeId);
+            var targetNode = nodes.First(n => n.Id == edge.TargetNodeId);
+
+            if (!_routeNodes[mainRouteId].Contains(sourceNode))
+                _routeNodes[mainRouteId].Add(sourceNode);
+            if (!_routeNodes[mainRouteId].Contains(targetNode))
+                _routeNodes[mainRouteId].Add(targetNode);
+        }
+    }
+
+    private void OptimizeNodePlacement(List<TransportNode> nodes)
+    {
+        // Normaliser les coordonnées
+        NormalizeCoordinates(nodes);
+        
+        // Aligner sur la grille
+        AlignToGrid(nodes);
+        
+        // Optimiser les stations de transfert
+        OptimizeTransferStations(nodes);
+        
+        // Dénormaliser les coordonnées
+        DenormalizeCoordinates(nodes);
+    }
+
+    private void NormalizeCoordinates(List<TransportNode> nodes)
+    {
+        var width = _maxBounds.X - _minBounds.X;
+        var height = _maxBounds.Y - _minBounds.Y;
+
+        foreach (var node in nodes)
+        {
+            var normalizedPos = new Vector2(
+                (node.Position.X - _minBounds.X) / width,
+                (node.Position.Y - _minBounds.Y) / height
+            );
+            node.GetType().GetProperty("Position")?.SetValue(node, normalizedPos);
+        }
+    }
+
+    private void AlignToGrid(List<TransportNode> nodes)
+    {
+        foreach (var node in nodes)
+        {
+            var alignedPos = new Vector2(
+                MathF.Round(node.Position.X / GRID_SIZE) * GRID_SIZE,
+                MathF.Round(node.Position.Y / GRID_SIZE) * GRID_SIZE
+            );
+            node.GetType().GetProperty("Position")?.SetValue(node, alignedPos);
+        }
+    }
+
+    private void OptimizeTransferStations(List<TransportNode> nodes)
+    {
+        var transferNodes = nodes.Where(n => n.Type == NodeType.Transfer).ToList();
+        var processed = new HashSet<int>();
+
+        foreach (var node in transferNodes)
+        {
+            if (processed.Contains(node.Id)) continue;
+
+            var group = transferNodes.Where(n =>
+                !processed.Contains(n.Id) &&
+                Vector2.Distance(n.Position, node.Position) < TRANSFER_DISTANCE
+            ).ToList();
+
+            if (group.Any())
+            {
+                OptimizeTransferGroup(group);
+                foreach (var n in group)
+                    processed.Add(n.Id);
+            }
+        }
+    }
+
+    private void OptimizeTransferGroup(List<TransportNode> group)
+    {
+        var center = new Vector2(
+            group.Average(n => n.Position.X),
+            group.Average(n => n.Position.Y)
+        );
+
+        var angleStep = 2 * MathF.PI / group.Count;
+        for (int i = 0; i < group.Count; i++)
+        {
+            var angle = i * angleStep;
+            var offset = new Vector2(
+                MathF.Cos(angle) * TRANSFER_DISTANCE / 2,
+                MathF.Sin(angle) * TRANSFER_DISTANCE / 2
+            );
+            
+            var newPos = center + offset;
+            group[i].GetType().GetProperty("Position")?.SetValue(group[i], newPos);
+        }
+    }
+
+    private void DenormalizeCoordinates(List<TransportNode> nodes)
+    {
+        var width = _maxBounds.X - _minBounds.X;
+        var height = _maxBounds.Y - _minBounds.Y;
+
+        foreach (var node in nodes)
+        {
+            var denormalizedPos = new Vector2(
+                node.Position.X * width + _minBounds.X,
+                node.Position.Y * height + _minBounds.Y
+            );
+            node.GetType().GetProperty("Position")?.SetValue(node, denormalizedPos);
+        }
+    }
+
+    private string GetMainRouteId(string routeId)
+    {
+        // Extraire l'identifiant principal (A, B, C, D) de la ligne
+        if (string.IsNullOrEmpty(routeId)) return routeId;
+        return routeId.Split('_')[0].ToUpper();
+    }
+
+    private string GetRouteColor(string routeId)
+    {
+        if (LineColors.TryGetValue(routeId, out var color))
+            return color;
+
+        // Générer une couleur unique pour les autres lignes
+        var hash = routeId.GetHashCode();
+        var hue = Math.Abs(hash % 360);
+        return $"hsl({hue}, 70%, 50%)";
+    }
+}
+
+
+
+public partial class SVGRenderer
+{
+    private void WriteHeader(RenderingOptions options)
+    {
+        _builder.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        _builder.AppendLine($"<svg width=\"{options.Width}\" height=\"{options.Height}\" " +
+                          $"version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\">");
+        
+        // Fond blanc
+        _builder.AppendLine($"  <rect width=\"100%\" height=\"100%\" fill=\"{options.BackgroundColor}\"/>");
+        
+        // Définitions
+        _builder.AppendLine("  <defs>");
+        WriteGradientDefs();
+        WriteFilterDefs();
+        WritePatternDefs();
+        _builder.AppendLine("  </defs>");
+    }
+
+    private void WriteGradientDefs()
+    {
+        // Station gradients
+        WriteStationGradient("station-gradient", "#ffffff", "#f0f0f0");
+        WriteStationGradient("transfer-station-gradient", "#f8f8f8", "#e0e0e0");
+        WriteStationGradient("terminal-station-gradient", "#ffffff", "#e8e8e8");
+
+        // Line gradients
+        foreach (var color in LineColors)
+        {
+            WriteLineGradient($"line-gradient-{color.Key}", color.Value);
+        }
+    }
+
+    private void WriteStationGradient(string id, string startColor, string endColor)
+    {
+        _builder.AppendLine($@"    <linearGradient id=""{id}"" x1=""0%"" y1=""0%"" x2=""100%"" y2=""100%"">
+      <stop offset=""0%"" style=""stop-color:{startColor};stop-opacity:1"" />
+      <stop offset=""100%"" style=""stop-color:{endColor};stop-opacity:1"" />
+    </linearGradient>");
+    }
+
+    private void WriteLineGradient(string id, string baseColor)
+    {
+        var lightColor = AdjustColorBrightness(baseColor, 1.2f);
+        var darkColor = AdjustColorBrightness(baseColor, 0.8f);
+
+        _builder.AppendLine($@"    <linearGradient id=""{id}"" x1=""0%"" y1=""0%"" x2=""100%"" y2=""0%"">
+      <stop offset=""0%"" style=""stop-color:{darkColor};stop-opacity:1"" />
+      <stop offset=""50%"" style=""stop-color:{baseColor};stop-opacity:1"" />
+      <stop offset=""100%"" style=""stop-color:{lightColor};stop-opacity:1"" />
+    </linearGradient>");
+    }
+
+    private void WriteFilterDefs()
+    {
+        // Station shadow
+        _builder.AppendLine(@"    <filter id=""station-shadow"" x=""-20%"" y=""-20%"" width=""140%"" height=""140%"">
+      <feGaussianBlur in=""SourceAlpha"" stdDeviation=""1.5"" />
+      <feOffset dx=""1"" dy=""1"" result=""offsetblur"" />
+      <feComponentTransfer>
+        <feFuncA type=""linear"" slope=""0.3"" />
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode />
+        <feMergeNode in=""SourceGraphic"" />
+      </feMerge>
+    </filter>");
+
+        // Line shadow
+        _builder.AppendLine(@"    <filter id=""line-shadow"" x=""-20%"" y=""-20%"" width=""140%"" height=""140%"">
+      <feGaussianBlur in=""SourceAlpha"" stdDeviation=""2"" />
+      <feOffset dx=""2"" dy=""2"" result=""offsetblur"" />
+      <feComponentTransfer>
+        <feFuncA type=""linear"" slope=""0.2"" />
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode />
+        <feMergeNode in=""SourceGraphic"" />
+      </feMerge>
+    </filter>");
+    }
+
+    private void WritePatternDefs()
+    {
+        // Pattern pour les zones de transfert
+        _builder.AppendLine(@"    <pattern id=""transfer-pattern"" width=""10"" height=""10"" patternUnits=""userSpaceOnUse"">
+      <circle cx=""5"" cy=""5"" r=""2"" fill=""#f0f0f0"" />
+    </pattern>");
+    }
+
+    private void WriteStyles(RenderingOptions options)
+    {
+        _builder.AppendLine($@"  <style>
+    .station {{
+      stroke-width: 2;
+      filter: url(#station-shadow);
+    }}
+    .station.regular {{
+      fill: url(#station-gradient);
+    }}
+    .station.transfer {{
+      fill: url(#transfer-station-gradient);
+      stroke-width: 2.5;
+    }}
+    .station.terminal {{
+      fill: url(#terminal-station-gradient);
+    }}
+    .station-label {{
+      font-family: Arial, sans-serif;
+      font-weight: 500;
+      text-anchor: middle;
+      dominant-baseline: hanging;
+      fill: {options.LabelColor};
+      font-size: {options.LabelFontSize}px;
+      filter: url(#station-shadow);
+    }}
+    .metro-line {{
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      filter: url(#line-shadow);
+      stroke-width: {options.LineWidth}px;
+    }}
+    .line-label {{
+      font-family: Arial, sans-serif;
+      font-weight: bold;
+      fill: white;
+      text-anchor: middle;
+      dominant-baseline: middle;
+      font-size: {options.LabelFontSize * 0.8f}px;
+    }}
+  </style>");
+    }
+
+    private void WriteMetroLines(List<TransportEdge> edges, List<TransportNode> nodes, RenderingOptions options)
+    {
+        _builder.AppendLine("  <g class=\"metro-lines\">");
+
+        foreach (var line in _metroLines.Values.OrderBy(l => l.RouteId))
+        {
+            var pathBuilder = new StringBuilder();
+            pathBuilder.Append("    M ");
+
+            var segments = GenerateLineSegments(line);
+            foreach (var segment in segments)
+            {
+                var start = TransformPoint(segment.Start);
+                var end = TransformPoint(segment.End);
+
+                if (segment.IsTransfer)
+                {
+                    // Utiliser une courbe de Bézier pour les transitions
+                    var control1 = CalculateControlPoint(segment.Start, segment.End, 0.25f);
+                    var control2 = CalculateControlPoint(segment.Start, segment.End, 0.75f);
+                    var transformedControl1 = TransformPoint(control1);
+                    var transformedControl2 = TransformPoint(control2);
+
+                    pathBuilder.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        "{0:F1},{1:F1} C {2:F1},{3:F1} {4:F1},{5:F1} {6:F1},{7:F1} ",
+                        start.X, start.Y,
+                        transformedControl1.X, transformedControl1.Y,
+                        transformedControl2.X, transformedControl2.Y,
+                        end.X, end.Y
+                    );
+                }
+                else
+                {
+                    pathBuilder.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        "{0:F1},{1:F1} L {2:F1},{3:F1} ",
+                        start.X, start.Y,
+                        end.X, end.Y
+                    );
+                }
+            }
+
+            _builder.AppendLine($@"    <path class=""metro-line"" 
+                  stroke=""{line.Color}"" 
+                  d=""{pathBuilder}""/>");
+        }
+
+        _builder.AppendLine("  </g>");
+    }
+
+    private void WriteStations(List<TransportNode> nodes, RenderingOptions options)
+    {
+        _builder.AppendLine("  <g class=\"stations\">");
+
+        foreach (var node in nodes)
+        {
+            var pos = TransformPoint(node.Position);
+            var radius = GetStationRadius(node);
+            var stationClass = GetStationClass(node.Type);
+
+            _builder.AppendLine($@"    <circle class=""station {stationClass}"" 
+                  cx=""{pos.X:F1}"" 
+                  cy=""{pos.Y:F1}"" 
+                  r=""{radius}"" 
+                  stroke=""{options.StationStrokeColor}""/>");
+        }
+
+        _builder.AppendLine("  </g>");
+    }
+
+    private void WriteLabels(List<TransportNode> nodes, RenderingOptions options)
+    {
+        _builder.AppendLine("  <g class=\"station-labels\">");
+
+        foreach (var node in nodes)
+        {
+            var pos = TransformPoint(node.Position);
+            var labelOffset = CalculateLabelOffset(node, nodes);
+            var escapedName = HttpUtility.HtmlEncode(node.Name);
+            var angle = CalculateLabelAngle(node, nodes);
+
+            _builder.AppendLine($@"    <text class=""station-label"" 
+                  x=""{pos.X + labelOffset.X:F1}"" 
+                  y=""{pos.Y + labelOffset.Y:F1}""
+                  transform=""rotate({angle:F1} {pos.X:F1} {pos.Y:F1})"">{escapedName}</text>");
+        }
+
+        _builder.AppendLine("  </g>");
+    }
+
+    private float GetStationRadius(TransportNode node) => node.Type switch
+    {
+        NodeType.Transfer => 6.0f,
+        NodeType.Terminal => 5.0f,
+        _ => 4.0f
+    };
+
+    private string GetStationClass(NodeType type) => type switch
+    {
+        NodeType.Transfer => "transfer",
+        NodeType.Terminal => "terminal",
+        _ => "regular"
+    };
+
+    private Vector2 CalculateLabelOffset(TransportNode node, List<TransportNode> allNodes)
+    {
+        var nearbyNodes = allNodes.Where(n =>
+            n.Id != node.Id &&
+            Vector2.Distance(n.Position, node.Position) < GRID_SIZE * 2
+        ).ToList();
+
+        if (!nearbyNodes.Any())
+            return new Vector2(0, 16); // Offset vertical par défaut
+
+        // Calculer la direction moyenne des nœuds voisins
+        var avgDirection = Vector2.Zero;
+        foreach (var neighbor in nearbyNodes)
+        {
+            avgDirection += Vector2.Normalize(neighbor.Position - node.Position);
+        }
+        avgDirection /= nearbyNodes.Count;
+
+        // Calculer l'offset dans la direction opposée
+        var offset = -Vector2.Normalize(avgDirection) * 20;
+        return offset;
+    }
+
+    private float CalculateLabelAngle(TransportNode node, List<TransportNode> allNodes)
+    {
+        var nearbyNodes = allNodes.Where(n =>
+            n.Id != node.Id &&
+            Vector2.Distance(n.Position, node.Position) < GRID_SIZE * 2
+        ).ToList();
+
+        if (!nearbyNodes.Any())
+            return 0;
+
+        var avgDirection = Vector2.Zero;
+        foreach (var neighbor in nearbyNodes)
+        {
+            avgDirection += Vector2.Normalize(neighbor.Position - node.Position);
+        }
+        avgDirection /= nearbyNodes.Count;
+
+        return MathF.Atan2(avgDirection.Y, avgDirection.X) * 180 / MathF.PI;
+    }
+
+    private List<LineSegment> GenerateLineSegments(MetroLine line)
+    {
+        var segments = new List<LineSegment>();
+        if (line.Points.Count < 2) return segments;
+
+        for (int i = 0; i < line.Points.Count - 1; i++)
+        {
+            segments.Add(new LineSegment
+            {
+                Start = line.Points[i],
+                End = line.Points[i + 1],
+                RouteId = line.RouteId,
+                IsTransfer = IsTransferSegment(line, i)
+            });
+        }
+
+        return segments;
+    }
+
+    private bool IsTransferSegment(MetroLine line, int index)
+    {
+        if (index >= line.Stations.Count - 1) return false;
+        return line.Stations[index].Type == NodeType.Transfer ||
+               line.Stations[index + 1].Type == NodeType.Transfer;
+    }
+
+    private Vector2 CalculateControlPoint(Vector2 start, Vector2 end, float t)
+    {
+        var dir = end - start;
+        var perpendicular = new Vector2(-dir.Y, dir.X);
+        var normalized = Vector2.Normalize(perpendicular);
+        var distance = Vector2.Distance(start, end);
+        var curvature = distance * 0.2f;
+        var bulge = normalized * curvature * MathF.Sin(t * MathF.PI);
+        return Vector2.Lerp(start, end, t) + bulge;
+    }
+
+    private string AdjustColorBrightness(string color, float factor)
+    {
+        if (color.StartsWith("#"))
+        {
+            // Convertir la couleur hex en HSL
+            var r = Convert.ToInt32(color.Substring(1, 2), 16);
+            var g = Convert.ToInt32(color.Substring(3, 2), 16);
+            var b = Convert.ToInt32(color.Substring(5, 2), 16);
+
+            // Ajuster la luminosité
+            r = (int)MathF.Min(255, r * factor);
+            g = (int)MathF.Min(255, g * factor);
+            b = (int)MathF.Min(255, b * factor);
+
+            return $"#{r:X2}{g:X2}{b:X2}";
+        }
+
+        return color;
+    }
+
+    private void WriteFooter()
+    {
+        _builder.AppendLine("</svg>");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+}

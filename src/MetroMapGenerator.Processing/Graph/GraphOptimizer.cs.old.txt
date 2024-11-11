@@ -1,0 +1,329 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Linq;
+using MetroMapGenerator.Core.Models;
+using MetroMapGenerator.Core.Configuration;
+using MetroMapGenerator.Core.Interfaces;
+
+namespace MetroMapGenerator.Processing.Graph
+{
+    public class GraphOptimizer : IGraphOptimizer
+    {
+        private readonly ProcessingOptions _options;
+        private readonly Dictionary<int, List<int>> _adjacencyList;
+        private const float FORCE_MULTIPLIER = 0.1f;
+        private const float MIN_DISTANCE = 0.001f;
+        private const float MAX_FORCE = 1.0f;
+        private const float EPSILON = 1e-6f;
+
+        private Vector2 _originalMin;
+        private Vector2 _originalMax;
+        private Vector2 _scale;
+
+        public GraphOptimizer(ProcessingOptions options)
+        {
+            _options = options ?? throw new ArgumentNullException(nameof(options));
+            _adjacencyList = new Dictionary<int, List<int>>();
+        }
+
+        public IEnumerable<TransportNode> OptimizeLayout(
+            IEnumerable<TransportNode> nodes,
+            IEnumerable<TransportEdge> edges)
+        {
+            if (nodes == null) throw new ArgumentNullException(nameof(nodes));
+            if (edges == null) throw new ArgumentNullException(nameof(edges));
+
+            var nodesList = nodes.ToList();
+            Console.WriteLine($"Starting layout optimization with {nodesList.Count} nodes");
+
+            // Filtrer et valider les nœuds
+            var validNodes = ValidateAndFilterNodes(nodesList);
+            if (!validNodes.Any())
+            {
+                throw new InvalidOperationException("No valid nodes provided for layout optimization");
+            }
+
+            try
+            {
+                BuildAdjacencyList(edges);
+                SaveOriginalBounds(validNodes);
+                
+                // Normaliser les coordonnées
+                NormalizeCoordinates(validNodes);
+                ValidateNormalizedNodes(validNodes);
+
+                // Optimisation itérative
+                for (int i = 0; i < _options.ForceDirectedIterations; i++)
+                {
+                    var temperature = 1.0f - (i / (float)_options.ForceDirectedIterations);
+                    ApplyForceDirectedIteration(validNodes, temperature);
+                    if (i % 5 == 0) // Snap tous les 5 itérations pour éviter trop de contraintes
+                    {
+                        SnapToAngles(validNodes);
+                    }
+                    ValidateNodesAfterIteration(validNodes, i);
+                }
+
+                // Restaurer les coordonnées d'origine
+                RestoreOriginalScale(validNodes);
+                ValidateFinalNodes(validNodes);
+
+                return validNodes;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during layout optimization: {ex.Message}");
+                throw;
+            }
+        }
+
+        private List<TransportNode> ValidateAndFilterNodes(List<TransportNode> nodes)
+        {
+            var validNodes = nodes.Where(n =>
+                n != null &&
+                !float.IsNaN(n.Position.X) && !float.IsNaN(n.Position.Y) &&
+                !float.IsInfinity(n.Position.X) && !float.IsInfinity(n.Position.Y)
+            ).ToList();
+
+            Console.WriteLine($"Filtered {validNodes.Count} valid nodes from {nodes.Count} total nodes");
+            return validNodes;
+        }
+
+        private void SaveOriginalBounds(List<TransportNode> nodes)
+        {
+            _originalMin = new Vector2(
+                nodes.Min(n => n.Position.X),
+                nodes.Min(n => n.Position.Y)
+            );
+            _originalMax = new Vector2(
+                nodes.Max(n => n.Position.X),
+                nodes.Max(n => n.Position.Y)
+            );
+            _scale = new Vector2(
+                _originalMax.X - _originalMin.X,
+                _originalMax.Y - _originalMin.Y
+            );
+
+            if (_scale.X <= EPSILON || _scale.Y <= EPSILON)
+            {
+                throw new InvalidOperationException("Invalid coordinate range for scaling");
+            }
+        }
+
+        private void NormalizeCoordinates(List<TransportNode> nodes)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                var normalizedPos = new Vector2(
+                    (nodes[i].Position.X - _originalMin.X) / _scale.X,
+                    (nodes[i].Position.Y - _originalMin.Y) / _scale.Y
+                );
+                
+                // Assurer que les coordonnées sont dans [0,1]
+                normalizedPos = new Vector2(
+                    Math.Clamp(normalizedPos.X, 0f, 1f),
+                    Math.Clamp(normalizedPos.Y, 0f, 1f)
+                );
+
+                nodes[i] = nodes[i].WithPosition(normalizedPos);
+            }
+        }
+
+        private void RestoreOriginalScale(List<TransportNode> nodes)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                var denormalizedPos = new Vector2(
+                    nodes[i].Position.X * _scale.X + _originalMin.X,
+                    nodes[i].Position.Y * _scale.Y + _originalMin.Y
+                );
+                nodes[i] = nodes[i].WithPosition(denormalizedPos);
+            }
+        }
+
+        private void BuildAdjacencyList(IEnumerable<TransportEdge> edges)
+        {
+            _adjacencyList.Clear();
+            foreach (var edge in edges)
+            {
+                if (!_adjacencyList.ContainsKey(edge.SourceNodeId))
+                {
+                    _adjacencyList[edge.SourceNodeId] = new List<int>();
+                }
+                if (!_adjacencyList.ContainsKey(edge.TargetNodeId))
+                {
+                    _adjacencyList[edge.TargetNodeId] = new List<int>();
+                }
+
+                if (!_adjacencyList[edge.SourceNodeId].Contains(edge.TargetNodeId))
+                {
+                    _adjacencyList[edge.SourceNodeId].Add(edge.TargetNodeId);
+                }
+                if (!_adjacencyList[edge.TargetNodeId].Contains(edge.SourceNodeId))
+                {
+                    _adjacencyList[edge.TargetNodeId].Add(edge.SourceNodeId);
+                }
+            }
+        }
+
+        private void ApplyForceDirectedIteration(List<TransportNode> nodes, float temperature)
+        {
+            var forces = new Dictionary<int, Vector2>();
+
+            // Calculer les forces pour tous les nœuds
+            Parallel.ForEach(nodes, node =>
+            {
+                var force = CalculateNodeForces(node, nodes);
+                force *= temperature;
+                
+                // Limiter la magnitude de la force
+                if (force.Length() > MAX_FORCE)
+                {
+                    force = Vector2.Normalize(force) * MAX_FORCE;
+                }
+                
+                lock(forces)
+                {
+                    forces[node.Id] = force;
+                }
+            });
+
+            // Appliquer les forces calculées
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                if (!forces.TryGetValue(nodes[i].Id, out var force)) continue;
+
+                var newPosition = nodes[i].Position + force;
+                
+                // Maintenir les positions dans [0,1]
+                newPosition = new Vector2(
+                    Math.Clamp(newPosition.X, 0f, 1f),
+                    Math.Clamp(newPosition.Y, 0f, 1f)
+                );
+
+                nodes[i] = nodes[i].WithPosition(newPosition);
+            }
+        }
+
+        private Vector2 CalculateNodeForces(TransportNode node, List<TransportNode> allNodes)
+        {
+            var force = Vector2.Zero;
+
+            // Forces répulsives
+            foreach (var otherNode in allNodes)
+            {
+                if (otherNode.Id == node.Id) continue;
+
+                var delta = node.Position - otherNode.Position;
+                var distance = delta.Length();
+                
+                if (distance < MIN_DISTANCE) continue;
+
+                // Force répulsive inversement proportionnelle au carré de la distance
+                force += Vector2.Normalize(delta) * (FORCE_MULTIPLIER / (distance * distance));
+            }
+
+            // Forces attractives
+            if (_adjacencyList.TryGetValue(node.Id, out var neighbors))
+            {
+                foreach (var neighborId in neighbors)
+                {
+                    var neighbor = allNodes.First(n => n.Id == neighborId);
+                    var delta = neighbor.Position - node.Position;
+                    var distance = delta.Length();
+
+                    if (distance < MIN_DISTANCE) continue;
+
+                    // Force attractive basée sur la distance optimale
+                    var optimalDistance = _options.MinStopDistance;
+                    force += delta * FORCE_MULTIPLIER * (float)(optimalDistance - distance);
+                }
+            }
+
+            return force;
+        }
+
+        private void SnapToAngles(List<TransportNode> nodes)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                if (!_adjacencyList.TryGetValue(nodes[i].Id, out var neighbors) || 
+                    neighbors.Count != 2) continue;
+
+                var prev = nodes.First(n => n.Id == neighbors[0]);
+                var next = nodes.First(n => n.Id == neighbors[1]);
+
+                var angle = CalculateAngle(prev.Position, nodes[i].Position, next.Position);
+                
+                // Aligner si proche de 180 degrés
+                if (Math.Abs(angle - 180) < _options.AngleSnap)
+                {
+                    var direction = Vector2.Normalize(next.Position - prev.Position);
+                    var midPoint = prev.Position + direction * (Vector2.Distance(prev.Position, next.Position) * 0.5f);
+
+                    // S'assurer que la nouvelle position reste dans les limites
+                    midPoint = new Vector2(
+                        Math.Clamp(midPoint.X, 0f, 1f),
+                        Math.Clamp(midPoint.Y, 0f, 1f)
+                    );
+
+                    nodes[i] = nodes[i].WithPosition(midPoint);
+                }
+            }
+        }
+
+        private float CalculateAngle(Vector2 p1, Vector2 p2, Vector2 p3)
+        {
+            var v1 = Vector2.Normalize(p1 - p2);
+            var v2 = Vector2.Normalize(p3 - p2);
+            var dot = Vector2.Dot(v1, v2);
+            
+            // Limiter le dot product à [-1, 1] pour éviter des problèmes numériques
+            dot = Math.Clamp(dot, -1f, 1f);
+            
+            return MathF.Acos(dot) * 180f / MathF.PI;
+        }
+
+        private void ValidateNormalizedNodes(List<TransportNode> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                if (float.IsNaN(node.Position.X) || float.IsNaN(node.Position.Y) ||
+                    float.IsInfinity(node.Position.X) || float.IsInfinity(node.Position.Y) ||
+                    node.Position.X < -EPSILON || node.Position.X > 1 + EPSILON ||
+                    node.Position.Y < -EPSILON || node.Position.Y > 1 + EPSILON)
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid normalized position for node {node.Id}: ({node.Position.X}, {node.Position.Y})");
+                }
+            }
+        }
+
+        private void ValidateNodesAfterIteration(List<TransportNode> nodes, int iteration)
+        {
+            foreach (var node in nodes)
+            {
+                if (float.IsNaN(node.Position.X) || float.IsNaN(node.Position.Y))
+                {
+                    throw new InvalidOperationException(
+                        $"NaN position detected after iteration {iteration} for node {node.Id}");
+                }
+            }
+        }
+
+        private void ValidateFinalNodes(List<TransportNode> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                if (float.IsNaN(node.Position.X) || float.IsNaN(node.Position.Y) ||
+                    float.IsInfinity(node.Position.X) || float.IsInfinity(node.Position.Y))
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid final position for node {node.Id}: ({node.Position.X}, {node.Position.Y})");
+                }
+            }
+            Console.WriteLine($"Final validation passed for {nodes.Count} nodes");
+        }
+    }
+}
